@@ -30,11 +30,11 @@ except ModuleNotFoundError:
 
 try:
     from sentence_transformers import SentenceTransformer, util
-    semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+    st_model = SentenceTransformer('all-MiniLM-L6-v2')
     semantic_available = True
 except ModuleNotFoundError:
     semantic_available = False
-    st.warning("sentence-transformers not installed: reference-free semantic evaluation disabled.")
+    st.warning("sentence-transformers not installed: semantic scoring disabled.")
 
 # =========================
 # App Setup
@@ -59,21 +59,18 @@ def update_score(username, points):
     st.session_state.leaderboard[username] += points
 
 # =========================
-# Idioms & Collocations (Instructor-provided)
+# Idioms/Collocations Pool
 # =========================
-idioms_dict = {
-    "Literary": ["break the ice", "once upon a time"],
-    "Legal": ["beyond reasonable doubt", "due diligence"],
-    "Journalistic": ["breaking news", "on the record"],
-    "Scientific": ["statistical significance", "control group"]
-}
+idioms_en = ["kick the bucket", "break the ice", "once upon a time"]
+idioms_ar = ["فارَق الحياة", "كسر الجمود", "كان يا ما كان"]
 
-def check_idioms(text, genre):
-    feedback = []
-    for idiom in idioms_dict.get(genre, []):
-        if idiom not in text:
-            feedback.append(f"Consider using the idiom/collocation: '{idiom}'")
-    return feedback
+def check_idioms(student_text, source_lang="en"):
+    detected = []
+    pool = idioms_en if source_lang=="en" else idioms_ar
+    for idiom in pool:
+        if idiom.lower() in student_text.lower():
+            detected.append(idiom)
+    return detected
 
 # =========================
 # Error Highlighting Function
@@ -99,24 +96,15 @@ def highlight_diff(student, reference):
     return highlighted, feedback
 
 # =========================
-# Semantic Evaluation
+# Semantic Score Function
 # =========================
-def semantic_score(source, student):
+def semantic_score(source_text, student_translation):
     if semantic_available:
-        source_emb = semantic_model.encode(source, convert_to_tensor=True)
-        student_emb = semantic_model.encode(student, convert_to_tensor=True)
-        score = util.pytorch_cos_sim(source_emb, student_emb).item()
-        return round(score, 2)
-    else:
-        return None
-
-# =========================
-# CSV Progress Tracking
-# =========================
-def save_progress(username, genre, source, student, points, semantic=None):
-    with open("progress.csv", "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), username, genre, source, student, points, semantic])
+        emb_source = st_model.encode(source_text, convert_to_tensor=True)
+        emb_student = st_model.encode(student_translation, convert_to_tensor=True)
+        score = util.cos_sim(emb_source, emb_student).item()  # 0-1
+        return score
+    return None
 
 # =========================
 # Tabs
@@ -129,61 +117,61 @@ tab1, tab2, tab3, tab4 = st.tabs(["Translate & Post-Edit", "Challenges", "Leader
 # Tab 1: Translate & Post-Edit
 # =========================
 with tab1:
-    st.subheader("🔎 Translate or Post-Edit MT Output")
-    genre = st.selectbox("Select Text Genre", ["Literary", "Legal", "Journalistic", "Scientific"])
+    st.subheader("🔎 Translate or Post-Edit")
     source_text = st.text_area("Source Text")
-    reference_translation = st.text_area("Reference Translation (Instructor Only)")
+    show_reference = st.checkbox("Show Reference Translation (Instructor Only)", value=False)
+    reference_translation = ""
+    if show_reference:
+        reference_translation = st.text_area("Reference Translation (Human Translation)")
+
     student_translation = st.text_area("Your Translation", height=150)
-    reference_free = st.checkbox("Reference-Free Evaluation (no human translation)")
 
     start_time = time.time()
     if st.button("Evaluate Translation"):
-        feedback = []
-        if not reference_free and reference_translation.strip():
+        # Highlight literal errors if reference exists
+        if reference_translation:
             highlighted, fb = highlight_diff(student_translation, reference_translation)
             st.markdown(highlighted, unsafe_allow_html=True)
-            feedback.extend(fb)
         else:
-            st.info("Reference-free mode: direct semantic assessment.")
+            fb = []
+            st.info("No reference provided; semantic evaluation only.")
 
-        # Idioms/collocations feedback
-        idiom_feedback = check_idioms(student_translation, genre)
-        feedback.extend(idiom_feedback)
+        # Semantic Score
+        sem_score = semantic_score(source_text, student_translation)
+        if sem_score is not None:
+            st.write(f"Semantic Accuracy Score (0-1): {sem_score:.2f}")
 
-        # Display feedback
-        st.subheader("💡 Feedback:")
-        if feedback:
-            for f in feedback:
-                st.warning(f)
+        # Idioms / Collocations
+        idioms_detected = check_idioms(student_translation)
+        if idioms_detected:
+            st.success(f"Idioms detected: {', '.join(idioms_detected)}")
         else:
-            st.success("No errors detected. Good job!")
+            st.info("No idioms detected. Consider using appropriate idioms/collocations.")
 
-        # Scores
-        if not reference_free and sacrebleu_available and reference_translation.strip():
+        # BLEU/chrF/TER
+        if reference_translation and sacrebleu_available:
             bleu_score = sacrebleu.corpus_bleu([student_translation], [[reference_translation]]).score
             chrf_score = sacrebleu.corpus_chrf([student_translation], [[reference_translation]]).score
             ter_score = sacrebleu.corpus_ter([student_translation], [[reference_translation]]).score
             st.write(f"BLEU: {bleu_score:.2f}, chrF: {chrf_score:.2f}, TER: {ter_score:.2f}")
-        if levenshtein_available and not reference_free and reference_translation.strip():
+
+        # Edit Distance
+        if reference_translation and levenshtein_available:
             edit_dist = Levenshtein.distance(student_translation, reference_translation)
             st.write(f"Edit Distance: {edit_dist}")
 
-        # Semantic score
-        sem_score = semantic_score(source_text, student_translation)
-        if sem_score is not None:
-            st.write(f"Semantic Adequacy Score (0-1): {sem_score}")
-
+        # Time Taken
         elapsed_time = time.time() - start_time
         st.write(f"Time Taken: {elapsed_time:.2f} seconds")
 
         # Points
-        points = 10 + int(random.random()*10)
+        points = int(sem_score*50) if sem_score else 10
+        points += 5*len(idioms_detected)
         update_score(username, points)
         st.success(f"Points earned: {points}")
 
-        # Save feedback history & progress
-        st.session_state.feedback_history.append(feedback)
-        save_progress(username, genre, source_text, student_translation, points, sem_score)
+        # Save feedback
+        st.session_state.feedback_history.append(fb)
 
 # =========================
 # Tab 2: Challenges
@@ -191,11 +179,11 @@ with tab1:
 with tab2:
     st.subheader("⏱️ Timer Challenge Mode")
     challenges = [
-        ("I love you.", "أنا أحبك.", "Literary"),
-        ("Knowledge is power.", "المعرفة قوة.", "Scientific"),
-        ("The weather is nice today.", "الطقس جميل اليوم.", "Journalistic")
+        ("I love you.", "أنا أحبك."),
+        ("Knowledge is power.", "المعرفة قوة."),
+        ("The weather is nice today.", "الطقس جميل اليوم.")
     ]
-    
+
     if st.button("Start Challenge"):
         challenge = random.choice(challenges)
         st.session_state.challenge = challenge
@@ -206,13 +194,18 @@ with tab2:
         if st.button("Submit Challenge"):
             highlighted, fb = highlight_diff(user_ans, st.session_state.challenge[1])
             st.markdown(highlighted, unsafe_allow_html=True)
-            idiom_feedback = check_idioms(user_ans, st.session_state.challenge[2])
-            fb.extend(idiom_feedback)
-            st.subheader("Feedback:")
-            for f in fb:
-                st.warning(f)
-            
-            points = 10 + int(random.random()*10)
+
+            sem_score = semantic_score(st.session_state.challenge[0], user_ans)
+            st.write(f"Semantic Accuracy Score (0-1): {sem_score:.2f}" if sem_score else "")
+
+            idioms_detected = check_idioms(user_ans)
+            if idioms_detected:
+                st.success(f"Idioms detected: {', '.join(idioms_detected)}")
+            else:
+                st.info("No idioms detected.")
+
+            points = int(sem_score*50) if sem_score else 10
+            points += 5*len(idioms_detected)
             update_score(username, points)
             st.success(f"Points earned: {points}")
 
@@ -234,13 +227,10 @@ with tab3:
 with tab4:
     st.subheader("📊 Instructor Dashboard")
     if pd_available and st.session_state.leaderboard:
-        df = pd.DataFrame([
-            {"Student": user, "Points": points} 
-            for user, points in st.session_state.leaderboard.items()
-        ])
+        df = pd.DataFrame([{"Student": user, "Points": points} for user, points in st.session_state.leaderboard.items()])
         st.dataframe(df)
         st.bar_chart(df.set_index("Student")["Points"])
-        
+
         feedback_list = st.session_state.feedback_history
         all_errors = [f for sublist in feedback_list for f in sublist]
         if all_errors:
@@ -248,9 +238,11 @@ with tab4:
             error_df = pd.DataFrame(counter.items(), columns=["Error", "Count"]).sort_values(by="Count", ascending=False)
             st.subheader("Common Errors Across Class")
             st.table(error_df.head(10))
-            
+
             plt.figure(figsize=(10,6))
             sns.barplot(data=error_df.head(10), x="Count", y="Error")
             st.pyplot(plt)
-    else:
-        st.info("Instructor dashboard charts unavailable (pandas/seaborn not installed) or no student activity.")
+
+        # Save progress to CSV
+        df.to_csv("student_progress.csv", index=False)
+        st.success("Progress saved to CSV.")
