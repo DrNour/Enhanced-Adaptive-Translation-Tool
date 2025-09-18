@@ -1,7 +1,8 @@
 streamlit
-pandas
-requests
 sacrebleu
-python-Levenshtein
 bert-score
-unbabel-comet
+python-Levenshtein
+pandas
+matplotlib
+seaborn
+requests
