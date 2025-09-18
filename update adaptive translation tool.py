@@ -1,173 +1,122 @@
 import streamlit as st
-import time
-import random
-from difflib import SequenceMatcher
-import os
-import csv
+import pandas as pd
+import requests
+import difflib
+import Levenshtein as lev
+import sacrebleu
+from bert_score import score as bert_score
+from comet import download_model, load_from_checkpoint
 
-# Optional packages
-try:
-    import sacrebleu
-    sacrebleu_available = True
-except ModuleNotFoundError:
-    sacrebleu_available = False
-    st.warning("sacrebleu not installed: BLEU/chrF/TER scoring disabled.")
-
-try:
-    import Levenshtein
-    levenshtein_available = True
-except ModuleNotFoundError:
-    levenshtein_available = False
-    st.warning("python-Levenshtein not installed: Edit distance disabled.")
-
-try:
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    pd_available = True
-except ModuleNotFoundError:
-    pd_available = False
-    st.warning("pandas/seaborn/matplotlib not installed: Dashboard charts disabled.")
-
-try:
-    from bert_score import score as bert_score
-    bert_available = True
-except ModuleNotFoundError:
-    bert_available = False
-    st.warning("bert_score not installed: Semantic evaluation disabled.")
-
-# =========================
+# ------------------------
 # Setup
-# =========================
+# ------------------------
+HF_TOKEN = st.secrets["HF_TOKEN"]
+
 st.set_page_config(page_title="Adaptive Translation Tool", layout="wide")
+
+# Initialize COMET models (cached to avoid re-downloads)
+@st.cache_resource
+def load_comet_models():
+    try:
+        model_ref = load_from_checkpoint(download_model("Unbabel/wmt22-comet-da"))
+        model_qe = load_from_checkpoint(download_model("Unbabel/wmt22-cometkiwi-da"))
+        return model_ref, model_qe
+    except Exception:
+        return None, None
+
+comet_model_ref, comet_model_qe = load_comet_models()
+
+# ------------------------
+# Helper Functions
+# ------------------------
+def translate_text(text, src_lang="en", tgt_lang="ar"):
+    """Call Hugging Face Translation API."""
+    API_URL = f"https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-{src_lang}-{tgt_lang}"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    try:
+        response = requests.post(API_URL, headers=headers, json={"inputs": text})
+        if response.status_code == 200:
+            return response.json()[0]["translation_text"]
+        else:
+            return f"Error: {response.text}"
+    except Exception as e:
+        return f"API Error: {str(e)}"
+
+def compute_metrics(student, reference=None, source=None):
+    """Compute all metrics depending on availability of reference."""
+    results = {}
+
+    if reference:  # With reference
+        # BLEU / chrF / TER
+        bleu = sacrebleu.corpus_bleu([student], [[reference]])
+        chrf = sacrebleu.corpus_chrf([student], [[reference]])
+        ter = sacrebleu.corpus_ter([student], [[reference]])
+        results["BLEU"] = round(bleu.score, 2)
+        results["chrF"] = round(chrf.score, 2)
+        results["TER"] = round(ter.score, 2)
+
+        # BERTScore
+        P, R, F1 = bert_score([student], [reference], lang="en", verbose=False)
+        results["BERTScore_F1"] = float(F1.mean())
+
+        # COMET
+        if comet_model_ref:
+            data = [{"src": source or "", "mt": student, "ref": reference}]
+            comet_score = comet_model_ref.predict(data, batch_size=8, gpus=0)
+            results["COMET"] = float(comet_score.system_score)
+    else:  # Reference-free mode
+        if comet_model_qe:
+            data = [{"src": source or "", "mt": student}]
+            qe_score = comet_model_qe.predict(data, batch_size=8, gpus=0)
+            results["COMET-QE"] = float(qe_score.system_score)
+
+    return results
+
+def track_edits(student, reference):
+    """Compute edit distance details."""
+    if not reference:
+        return "No reference provided."
+    distance = lev.distance(student, reference)
+    ops = lev.opcodes(student, reference)
+    return {"EditDistance": distance, "Operations": ops}
+
+# ------------------------
+# UI
+# ------------------------
 st.title("🌍 Adaptive Translation & Post-Editing Tool")
 
-# =========================
-# User Role
-# =========================
 role = st.radio("I am a:", ["Student", "Instructor"])
 username = st.text_input("Enter your name:")
 
-# CSV file for tracking
-TRACK_FILE = "student_progress.csv"
-if not os.path.exists(TRACK_FILE):
-    with open(TRACK_FILE, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Username", "Points", "Time", "Source", "Submission"])
-
-# =========================
-# Functions
-# =========================
-def update_csv(username, points, elapsed_time, source, submission):
-    with open(TRACK_FILE, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([username, points, round(elapsed_time, 2), source, submission])
-
-def highlight_diff(student, reference):
-    matcher = SequenceMatcher(None, reference.split(), student.split())
-    highlighted = ""
-    feedback = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        stu_words = " ".join(student.split()[j1:j2])
-        ref_words = " ".join(reference.split()[i1:i2])
-        if tag == "equal":
-            highlighted += f"<span style='color:green'>{stu_words} </span>"
-        elif tag == "replace":
-            highlighted += f"<span style='color:red'>{stu_words} </span>"
-            feedback.append(f"Replace '{stu_words}' with '{ref_words}'")
-        elif tag == "insert":
-            highlighted += f"<span style='color:orange'>{stu_words} </span>"
-            feedback.append(f"Extra words: '{stu_words}'")
-        elif tag == "delete":
-            highlighted += f"<span style='color:blue'>{ref_words} </span>"
-            feedback.append(f"Missing: '{ref_words}'")
-    return highlighted, feedback
-
-def calculate_scores(student, reference):
-    scores = {}
-    if sacrebleu_available and reference:
-        scores["BLEU"] = sacrebleu.corpus_bleu([student], [[reference]]).score
-        scores["chrF"] = sacrebleu.corpus_chrf([student], [[reference]]).score
-        scores["TER"] = sacrebleu.corpus_ter([student], [[reference]]).score
-    if levenshtein_available:
-        scores["Edit Distance"] = Levenshtein.distance(student, reference) if reference else "N/A"
-    if bert_available:
-        if reference:
-            P, R, F1 = bert_score([student], [reference], lang="en")
-            scores["BERTScore"] = float(F1.mean())
-        else:
-            scores["BERTScore"] = "N/A"
-    return scores
-
-def suggest_idioms(text):
-    idioms = ["break the ice", "once upon a time", "kick the bucket"]
-    suggestions = [i for i in idioms if i not in text.lower()]
-    return suggestions
-
-# =========================
-# Student View
-# =========================
 if role == "Student":
-    st.subheader("🔎 Translate / Post-Edit")
+    st.header("✍️ Submit Translation")
 
-    source_text = st.text_area("Source Text")
-    reference_translation = st.text_area("Reference Translation (optional)")
-    student_translation = st.text_area("Your Translation", height=150)
+    source = st.text_area("Source Text (English):")
+    student_translation = st.text_area("Your Translation:")
+    reference = st.text_area("Reference Translation (optional):")
 
-    start_time = time.time()
-    if st.button("Submit Translation"):
-        elapsed_time = time.time() - start_time
-
-        # Highlight diff if reference is provided
-        if reference_translation.strip():
-            highlighted, feedback = highlight_diff(student_translation, reference_translation)
-            st.markdown(highlighted, unsafe_allow_html=True)
-            st.subheader("💡 Feedback:")
-            for f in feedback:
-                st.warning(f)
+    if st.button("Evaluate"):
+        if not student_translation:
+            st.warning("Please provide your translation.")
         else:
-            st.info("Reference not provided: only semantic evaluation applied.")
+            metrics = compute_metrics(student_translation, reference, source)
+            st.subheader("📊 Evaluation Results")
+            st.json(metrics)
 
-        # Calculate scores
-        scores = calculate_scores(student_translation, reference_translation)
-        st.subheader("📊 Scores:")
-        for k, v in scores.items():
-            st.write(f"{k}: {v}")
+            if reference:
+                st.subheader("🔍 Edit Tracking")
+                edits = track_edits(student_translation, reference)
+                st.json(edits)
 
-        # Idiom suggestions
-        idiom_suggestions = suggest_idioms(student_translation)
-        if idiom_suggestions:
-            st.subheader("💬 Idiom/Collocation Suggestions:")
-            for i in idiom_suggestions:
-                st.info(f"Consider using: '{i}'")
+elif role == "Instructor":
+    st.header("📊 Instructor Dashboard")
 
-        # Points & CSV tracking
-        points = random.randint(5, 15)
-        update_csv(username, points, elapsed_time, source_text, student_translation)
-        st.success(f"Points earned: {points}")
-        st.write(f"Time taken: {round(elapsed_time,2)} seconds")
+    uploaded = st.file_uploader("Upload student results CSV (Username, Source, Student, Reference, Points)", type=["csv"])
+    if uploaded:
+        df = pd.read_csv(uploaded)
+        leaderboard = df.groupby("Username")["Points"].sum().reset_index().sort_values(by="Points", ascending=False)
+        st.subheader("🏆 Leaderboard")
+        st.dataframe(leaderboard)
 
-# =========================
-# Instructor View
-# =========================
-if role == "Instructor":
-    st.subheader("📊 Instructor Dashboard")
-
-    if os.path.exists(TRACK_FILE):
-        df = pd.read_csv(TRACK_FILE) if pd_available else None
-        if pd_available and not df.empty:
-            leaderboard_df = df.groupby("Username")["Points"].sum().reset_index().sort_values(by="Points", ascending=False)
-            st.write("🏆 Leaderboard")
-            st.dataframe(leaderboard_df)
-
-            # Bar chart
-            st.subheader("📈 Points Chart")
-            st.bar_chart(leaderboard_df.set_index("Username")["Points"])
-
-            # Common errors
-            st.subheader("📌 Submissions")
-            st.dataframe(df)
-        else:
-            st.info("No data yet or pandas not available.")
-    else:
-        st.info("No submissions yet.")
+        st.subheader("📈 Distribution of Points")
+        st.bar_chart(leaderboard.set_index("Username"))
