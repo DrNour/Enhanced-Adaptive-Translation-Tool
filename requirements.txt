@@ -4,5 +4,4 @@ python-Levenshtein
 pandas
 matplotlib
 seaborn
-transformers
-torch
+bert-score
