@@ -1,4 +1,7 @@
 streamlit
+pandas
 requests
-python-docx
-PyPDF2
+sacrebleu
+python-Levenshtein
+bert-score
+unbabel-comet
