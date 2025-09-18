@@ -1,9 +1,8 @@
 import streamlit as st
-from difflib import SequenceMatcher
 import time
 import random
 import csv
-import os
+from difflib import SequenceMatcher
 
 # Optional packages
 try:
@@ -11,14 +10,12 @@ try:
     sacrebleu_available = True
 except ModuleNotFoundError:
     sacrebleu_available = False
-    st.warning("sacrebleu not installed: BLEU/chrF/TER scoring disabled.")
 
 try:
     import Levenshtein
     levenshtein_available = True
 except ModuleNotFoundError:
     levenshtein_available = False
-    st.warning("python-Levenshtein not installed: Edit distance disabled.")
 
 try:
     import pandas as pd
@@ -27,30 +24,22 @@ try:
     pd_available = True
 except ModuleNotFoundError:
     pd_available = False
-    st.warning("pandas/seaborn/matplotlib not installed: Dashboard charts disabled.")
 
 try:
-    from transformers import pipeline
+    from bert_score import score as bert_score
     bert_available = True
 except ModuleNotFoundError:
     bert_available = False
-    st.warning("transformers not installed: Semantic evaluation disabled.")
 
 # =========================
-# App Setup
+# Streamlit App Setup
 # =========================
 st.set_page_config(page_title="Adaptive Translation Tool", layout="wide")
 st.title("🌍 Adaptive Translation & Post-Editing Tool")
 
-# =========================
-# User role selection
-# =========================
 role = st.radio("I am a:", ["Student", "Instructor"])
 username = st.text_input("Enter your name:")
 
-# =========================
-# Session states
-# =========================
 if "score" not in st.session_state:
     st.session_state.score = 0
 if "leaderboard" not in st.session_state:
@@ -59,18 +48,7 @@ if "feedback_history" not in st.session_state:
     st.session_state.feedback_history = []
 
 # =========================
-# Hugging Face Semantic Evaluator
-# =========================
-hf_token = st.secrets.get("HF_TOKEN", None)
-if bert_available and hf_token:
-    try:
-        bert_scorer = pipeline("text-classification", model="roberta-large", use_auth_token=hf_token)
-    except Exception as e:
-        st.warning(f"Semantic evaluation unavailable: {e}")
-        bert_available = False
-
-# =========================
-# Leaderboard update
+# Utility Functions
 # =========================
 def update_score(username, points):
     st.session_state.score += points
@@ -78,9 +56,11 @@ def update_score(username, points):
         st.session_state.leaderboard[username] = 0
     st.session_state.leaderboard[username] += points
 
-# =========================
-# Error highlighting
-# =========================
+def save_submission(user, source, translation, reference, score_dict):
+    with open("submissions.csv", "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([user, source, translation, reference, str(score_dict), time.time()])
+
 def highlight_diff(student, reference):
     matcher = SequenceMatcher(None, reference.split(), student.split())
     highlighted = ""
@@ -101,86 +81,67 @@ def highlight_diff(student, reference):
             feedback.append(f"Missing: '{ref_words}'")
     return highlighted, feedback
 
-# =========================
-# CSV Logging
-# =========================
-LOG_FILE = "student_progress.csv"
-def log_progress(username, text, points):
-    exists = os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not exists:
-            writer.writerow(["Username","Translation","Points","Timestamp"])
-        writer.writerow([username, text, points, time.strftime("%Y-%m-%d %H:%M:%S")])
+def evaluate_translation(student, reference):
+    results = {}
+    # BLEU/chrF/TER
+    if reference and sacrebleu_available:
+        results["BLEU"] = sacrebleu.corpus_bleu([student], [[reference]]).score
+        results["chrF"] = sacrebleu.corpus_chrf([student], [[reference]]).score
+        results["TER"] = sacrebleu.corpus_ter([student], [[reference]]).score
+    # Edit distance
+    if reference and levenshtein_available:
+        results["EditDistance"] = Levenshtein.distance(student, reference)
+    # Semantic evaluation
+    if bert_available:
+        try:
+            P, R, F1 = bert_score([student], [reference or student], lang="en", rescale_with_baseline=True)
+            results["BERT_F1"] = F1[0].item()
+        except Exception as e:
+            results["BERT_F1"] = "Error: " + str(e)
+    return results
 
 # =========================
-# Tabs for students/instructors
+# Tabs
 # =========================
-tab1, tab2, tab3 = st.tabs(["Translate & Post-Edit", "Challenges", "Leaderboard"])
+tab1, tab2, tab3 = st.tabs(["Translate & Post-Edit", "Challenges", "Leaderboard/Instructor"])
 
 # =========================
-# Tab 1: Translation / Post-edit
+# Tab 1: Translate & Post-Edit
 # =========================
 with tab1:
-    st.subheader("🔎 Translate or Post-Edit MT Output")
+    st.subheader("🔎 Translate or Post-Edit")
     source_text = st.text_area("Source Text")
-    
-    # Only instructor sees reference
     reference_translation = ""
-    if role == "Instructor":
+    if role=="Instructor":
         reference_translation = st.text_area("Reference Translation (Instructor Only)")
-
     student_translation = st.text_area("Your Translation", height=150)
 
     start_time = time.time()
     if st.button("Evaluate Translation"):
-        elapsed_time = time.time() - start_time
-        points = 10 + int(random.random()*10)
-
-        # Highlight errors only if reference exists
+        score_dict = {}
         if reference_translation:
             highlighted, fb = highlight_diff(student_translation, reference_translation)
             st.markdown(highlighted, unsafe_allow_html=True)
             st.subheader("💡 Feedback:")
             for f in fb:
                 st.warning(f)
+            score_dict = evaluate_translation(student_translation, reference_translation)
         else:
-            st.info("No reference translation provided. Only semantic/fluency evaluation applied.")
-            fb = []
-
-        # BLEU/chrF/TER
-        if reference_translation and sacrebleu_available:
-            bleu_score = sacrebleu.corpus_bleu([student_translation],[ [reference_translation] ]).score
-            chrf_score = sacrebleu.corpus_chrf([student_translation],[ [reference_translation] ]).score
-            ter_score = sacrebleu.corpus_ter([student_translation],[ [reference_translation] ]).score
-            st.write(f"BLEU: {bleu_score:.2f}, chrF: {chrf_score:.2f}, TER: {ter_score:.2f}")
-        else:
-            st.info("BLEU/chrF/TER not computed (no reference or sacrebleu missing).")
-
-        # Edit distance
-        if reference_translation and levenshtein_available:
-            edit_dist = Levenshtein.distance(student_translation, reference_translation)
-            st.write(f"Edit Distance: {edit_dist}")
-
-        # Semantic/BERT evaluation
-        if bert_available:
-            try:
-                semantic_score = random.uniform(0,1)  # placeholder for BERT semantic similarity
-                st.write(f"Semantic Adequacy Score (0-1): {semantic_score:.2f}")
-            except Exception as e:
-                st.warning(f"Semantic evaluation failed: {e}")
-
-        st.write(f"Time Taken: {elapsed_time:.2f} seconds")
+            st.info("No reference provided: semantic/fluency evaluation only.")
+            score_dict = evaluate_translation(student_translation, None)
+        st.write("📊 Evaluation Results", score_dict)
+        elapsed_time = time.time() - start_time
+        st.write(f"Time Taken: {elapsed_time:.2f} sec")
+        points = 10 + int(random.random()*10)
         update_score(username, points)
-        log_progress(username, student_translation, points)
         st.success(f"Points earned: {points}")
-        st.session_state.feedback_history.append(fb)
+        save_submission(username, source_text, student_translation, reference_translation, score_dict)
 
 # =========================
 # Tab 2: Challenges
 # =========================
 with tab2:
-    st.subheader("⏱️ Timer Challenge Mode")
+    st.subheader("⏱️ Timed Challenge")
     challenges = [
         ("I love you.", "أنا أحبك."),
         ("Knowledge is power.", "المعرفة قوة."),
@@ -190,9 +151,8 @@ with tab2:
         challenge = random.choice(challenges)
         st.session_state.challenge = challenge
         st.write(f"Translate: **{challenge[0]}**")
-
     if "challenge" in st.session_state:
-        user_ans = st.text_area("Your Translation (Challenge Mode)", key="challenge_box")
+        user_ans = st.text_area("Your Translation (Challenge)", key="challenge_box")
         if st.button("Submit Challenge"):
             highlighted, fb = highlight_diff(user_ans, st.session_state.challenge[1])
             st.markdown(highlighted, unsafe_allow_html=True)
@@ -204,13 +164,27 @@ with tab2:
             st.success(f"Points earned: {points}")
 
 # =========================
-# Tab 3: Leaderboard
+# Tab 3: Leaderboard / Instructor
 # =========================
 with tab3:
-    st.subheader("🏆 Leaderboard")
-    if st.session_state.leaderboard:
-        sorted_lb = sorted(st.session_state.leaderboard.items(), key=lambda x:x[1], reverse=True)
-        for rank, (user, points) in enumerate(sorted_lb, start=1):
-            st.write(f"{rank}. **{user}** - {points} points")
-    else:
-        st.info("No scores yet. Start translating!")
+    if role=="Student":
+        st.subheader("🏆 Leaderboard")
+        if st.session_state.leaderboard:
+            sorted_lb = sorted(st.session_state.leaderboard.items(), key=lambda x: x[1], reverse=True)
+            for rank, (user, points) in enumerate(sorted_lb, start=1):
+                st.write(f"{rank}. **{user}** - {points} points")
+        else:
+            st.info("No scores yet. Start translating!")
+    elif role=="Instructor":
+        st.subheader("📊 Instructor Dashboard")
+        if pd_available:
+            try:
+                df = pd.read_csv("submissions.csv", header=None,
+                                 names=["Username","Source","Translation","Reference","Scores","Timestamp"])
+                st.dataframe(df)
+                df_points = df.groupby("Username").size().reset_index(name="Submissions")
+                st.bar_chart(df_points.set_index("Username")["Submissions"])
+            except FileNotFoundError:
+                st.info("No submissions yet.")
+        else:
+            st.info("Pandas/Matplotlib not installed: dashboard unavailable.")
