@@ -1,8 +1,8 @@
 streamlit
 sacrebleu
-bert-score
 python-Levenshtein
 pandas
 matplotlib
 seaborn
-requests
+transformers
+torch
