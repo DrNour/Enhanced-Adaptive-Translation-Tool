@@ -1,7 +1,10 @@
-streamlit
+streamlit>=1.24.1
 sacrebleu
 python-Levenshtein
 pandas
 matplotlib
 seaborn
 bert-score
+torch
+transformers
+comet-ml
