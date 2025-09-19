@@ -1,188 +1,157 @@
 import streamlit as st
+import pandas as pd
+import difflib
 import time
-import random
-from difflib import SequenceMatcher
 
-# Optional packages
+# Optional metrics
 try:
-    import sacrebleu
-    sacrebleu_available = True
-except ModuleNotFoundError:
-    sacrebleu_available = False
+    from sacrebleu import sentence_bleu, sentence_chrf, TER
+    import evaluate
+    comet_metric = evaluate.load("comet")
+    bertscore_metric = evaluate.load("bertscore")
+except Exception:
+    comet_metric = None
+    bertscore_metric = None
 
-try:
-    import Levenshtein
-    levenshtein_available = True
-except ModuleNotFoundError:
-    levenshtein_available = False
+# -----------------------
+# Database Simulation
+# -----------------------
+if "students" not in st.session_state:
+    st.session_state["students"] = {}
 
-try:
-    from bert_score import score as bert_score
-    bert_available = True
-except ModuleNotFoundError:
-    bert_available = False
+if "history" not in st.session_state:
+    st.session_state["history"] = []
 
-try:
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    pd_available = True
-except ModuleNotFoundError:
-    pd_available = False
+# -----------------------
+# Error Categorization (simple demo)
+# -----------------------
+def categorize_errors(reference, hypothesis):
+    errors = {"Lexical": [], "Grammar": [], "Idiomatic": [], "Semantic": []}
+    ref_words = set(reference.lower().split())
+    hyp_words = set(hypothesis.lower().split())
+    
+    for w in hyp_words:
+        if w not in ref_words:
+            if w.endswith("ed") or w.endswith("ing"):
+                errors["Grammar"].append(w)
+            elif len(w) > 8:
+                errors["Lexical"].append(w)
+            else:
+                errors["Semantic"].append(w)
+    if "like" in hypothesis.lower() and "as" not in reference.lower():
+        errors["Idiomatic"].append("like/as misuse")
+    return errors
 
-# COMET optional
-comet_enabled = False
-COMET_TOKEN = st.secrets.get("COMET_TOKEN") if "COMET_TOKEN" in st.secrets else None
-if COMET_TOKEN:
-    comet_enabled = True
-
-# =========================
-# App Setup
-# =========================
-st.set_page_config(page_title="Adaptive Translation Tool", layout="wide")
-st.title("🌍 Adaptive Translation & Post-Editing Tool")
-
-# User Role
-role = st.radio("I am a:", ["Student", "Instructor"])
-username = st.text_input("Enter your name:")
-
-# Session State
-if "score" not in st.session_state: st.session_state.score = 0
-if "leaderboard" not in st.session_state: st.session_state.leaderboard = {}
-if "submissions" not in st.session_state: st.session_state.submissions = []
-if "idioms" not in st.session_state: st.session_state.idioms = ["break the ice", "once upon a time"]
-
-# =========================
-# Functions
-# =========================
-def update_score(user, points):
-    st.session_state.score += points
-    st.session_state.leaderboard[user] = st.session_state.leaderboard.get(user,0) + points
-
-def highlight_diff(student, reference):
-    matcher = SequenceMatcher(None, reference.split(), student.split())
-    highlighted = ""
-    feedback = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        stu_words = " ".join(student.split()[j1:j2])
-        ref_words = " ".join(reference.split()[i1:i2])
-        if tag == "equal":
-            highlighted += f"<span style='color:green'>{stu_words} </span>"
-        elif tag == "replace":
-            highlighted += f"<span style='color:red'>{stu_words} </span>"
-            feedback.append(f"Replace '{stu_words}' with '{ref_words}'")
-        elif tag == "insert":
-            highlighted += f"<span style='color:orange'>{stu_words} </span>"
-            feedback.append(f"Extra words: '{stu_words}'")
-        elif tag == "delete":
-            highlighted += f"<span style='color:blue'>{ref_words} </span>"
-            feedback.append(f"Missing: '{ref_words}'")
-    return highlighted, feedback
-
-def evaluate_translation(student_translation, reference_translation=None):
+# -----------------------
+# Evaluation Function
+# -----------------------
+def evaluate_translation(ref, hyp):
     results = {}
-
-    # BLEU / chrF / TER
-    if sacrebleu_available and reference_translation:
+    try:
+        results["BLEU"] = sentence_bleu([hyp], [ref]).score
+        results["chrF"] = sentence_chrf([hyp], [ref]).score
+        results["TER"] = TER().corpus_score([hyp], [ref]).score
+    except:
+        results["BLEU"] = results["chrF"] = results["TER"] = None
+    
+    if bertscore_metric:
         try:
-            results["BLEU"] = sacrebleu.corpus_bleu([student_translation],[ [reference_translation] ]).score
-            results["chrF"] = sacrebleu.corpus_chrf([student_translation],[ [reference_translation] ]).score
-            results["TER"] = sacrebleu.corpus_ter([student_translation],[ [reference_translation] ]).score
+            bert_res = bertscore_metric.compute(predictions=[hyp], references=[ref], lang="en")
+            results["BERTScore"] = bert_res["f1"][0]
         except:
-            results["BLEU"] = results["chrF"] = results["TER"] = "Error"
-    else:
-        results["BLEU"] = results["chrF"] = results["TER"] = "N/A"
-
-    # Edit distance
-    if levenshtein_available and reference_translation:
+            results["BERTScore"] = None
+    
+    if comet_metric:
         try:
-            results["Edit Distance"] = Levenshtein.distance(student_translation, reference_translation)
+            comet_res = comet_metric.compute(predictions=[hyp], references=[ref], sources=[""])
+            results["COMET"] = comet_res["mean_score"]
         except:
-            results["Edit Distance"] = "Error"
-    else:
-        results["Edit Distance"] = "N/A"
-
-    # BERTScore
-    if bert_available:
-        try:
-            P, R, F1 = bert_score([student_translation],[student_translation if not reference_translation else reference_translation], lang="en", rescale_with_baseline=True)
-            results["BERT_F1"] = float(F1.mean())
-        except:
-            results["BERT_F1"] = "Error"
-    else:
-        results["BERT_F1"] = "N/A"
-
-    # COMET optional
-    if comet_enabled:
-        results["COMET"] = "Optional COMET evaluation here (requires API integration)"
-    else:
-        results["COMET"] = "Disabled"
-
+            results["COMET"] = None
     return results
 
-# =========================
-# Student Interface
-# =========================
-if role=="Student":
-    st.subheader("📝 Submit Your Translation")
-    source_text = st.text_area("Source Text", height=150)
-    student_translation = st.text_area("Your Translation", height=150)
+# -----------------------
+# Adaptive Suggestions
+# -----------------------
+def suggest_exercises(error_summary):
+    suggestions = []
+    if error_summary["Lexical"]:
+        suggestions.append("Revise key vocabulary in context and try synonym exercises.")
+    if error_summary["Grammar"]:
+        suggestions.append("Practice verb tense drills and sentence structure tasks.")
+    if error_summary["Idiomatic"]:
+        suggestions.append("Translate idiomatic expressions and proverbs.")
+    if error_summary["Semantic"]:
+        suggestions.append("Work on precision with collocations and semantic fields.")
+    if not suggestions:
+        suggestions.append("Excellent! Try a longer and more complex text.")
+    return suggestions
 
+# -----------------------
+# Streamlit UI
+# -----------------------
+st.title("EduTransAI – Translation Training Platform")
+
+# Login
+student_name = st.text_input("Enter your name to continue:")
+if not student_name:
+    st.stop()
+
+if student_name not in st.session_state["students"]:
+    st.session_state["students"][student_name] = {"points": 0, "submissions": []}
+
+menu = st.sidebar.radio("Menu", ["Dashboard", "Translate", "Leaderboard"])
+
+# Dashboard
+if menu == "Dashboard":
+    st.subheader(f"Welcome {student_name} 👋")
+    data = st.session_state["students"][student_name]
+    st.metric("Total Points", data["points"])
+    st.write("Your submissions:")
+    st.write(pd.DataFrame(data["submissions"]))
+
+# Translate
+elif menu == "Translate":
+    st.subheader("Translation Exercise")
+    source_text = st.text_area("Source Text", "With love’s light wings did I o’er-perch these walls; For stony limits cannot hold love out…")
+    reference = st.text_area("Reference Translation", "تسلقت هذه الجدران بجناحي الحب الخفيفين؛ فلا تستطيع حدود الحجارة أن تمنع الحب.")
+    
+    # Keystroke simulation (timestamp tracking)
+    if "keystrokes" not in st.session_state:
+        st.session_state["keystrokes"] = []
+    
+    student_translation = st.text_area("Your Translation")
+    if student_translation:
+        st.session_state["keystrokes"].append((time.time(), student_translation))
+    
     if st.button("Submit Translation"):
-        start_time = time.time()
-        results = evaluate_translation(student_translation)
-        elapsed = time.time() - start_time
+        results = evaluate_translation(reference, student_translation)
+        errors = categorize_errors(reference, student_translation)
+        suggestions = suggest_exercises(errors)
 
-        # Idioms / collocations
-        suggestions = [i for i in st.session_state.idioms if i in student_translation.lower()]
-        if not suggestions: suggestions = ["None detected"]
-
-        # Display results
-        st.subheader("📊 Evaluation Results")
-        st.json(results)
-        st.write(f"Time Taken: {elapsed:.2f} seconds")
-        points = 10 + int(random.random()*10)
-        update_score(username, points)
-        st.success(f"Points earned: {points}")
-
-        st.subheader("💡 Idioms / Collocations Suggestions")
-        st.write(suggestions)
-
-        # Save submission to instructor
-        st.session_state.submissions.append({
-            "username": username,
-            "source": source_text,
-            "translation": student_translation,
-            "results": results
+        # Save submission
+        st.session_state["students"][student_name]["submissions"].append({
+            "Source": source_text,
+            "Your Translation": student_translation,
+            "Reference": reference,
+            "Scores": results,
+            "Errors": errors,
+            "Suggestions": suggestions,
+            "Edits": len(st.session_state["keystrokes"])
         })
+        st.session_state["students"][student_name]["points"] += 10
+        
+        # Display Results
+        st.success("Translation submitted and evaluated ✅")
+        st.write("### Evaluation Scores", results)
+        st.write("### Error Categorization", errors)
+        st.write("### Adaptive Suggestions", suggestions)
+        st.write("### Edit History (keystrokes tracked)", st.session_state["keystrokes"])
 
-# =========================
-# Instructor Interface
-# =========================
-if role=="Instructor":
-    st.subheader("📊 Instructor Dashboard")
-    st.write("View student submissions:")
-
-    if st.session_state.submissions:
-        for i, s in enumerate(st.session_state.submissions):
-            st.markdown(f"**Student:** {s['username']}")
-            st.markdown(f"**Source:** {s['source']}")
-            st.markdown(f"**Translation:** {s['translation']}")
-            st.markdown(f"**Results:** {s['results']}")
-            st.markdown("---")
-    else:
-        st.info("No submissions yet.")
-
-    st.subheader("Leaderboard")
-    if st.session_state.leaderboard:
-        sorted_lb = sorted(st.session_state.leaderboard.items(), key=lambda x: x[1], reverse=True)
-        for rank, (user, pts) in enumerate(sorted_lb, start=1):
-            st.write(f"{rank}. **{user}** - {pts} points")
-    else:
-        st.info("No points yet.")
-
-    # Optional charts
-    if pd_available and st.session_state.leaderboard:
-        df = pd.DataFrame([{"Username": k, "Points": v} for k,v in st.session_state.leaderboard.items()])
-        st.dataframe(df)
-        st.bar_chart(df.set_index("Username")["Points"])
+# Leaderboard
+elif menu == "Leaderboard":
+    st.subheader("Leaderboard 🏆")
+    leaderboard = []
+    for s, d in st.session_state["students"].items():
+        leaderboard.append({"Student": s, "Points": d["points"]})
+    df = pd.DataFrame(leaderboard).sort_values("Points", ascending=False)
+    st.table(df)
