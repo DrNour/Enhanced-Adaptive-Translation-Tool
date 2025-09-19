@@ -1,6 +1,7 @@
-streamlit
+streamlit>=1.20
 sacrebleu
-bert-score
-evaluate
-pandas
 python-Levenshtein
+bert-score
+pandas
+matplotlib
+seaborn
