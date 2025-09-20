@@ -1,7 +1,4 @@
-streamlit==1.49.1
-sacrebleu
-python-Levenshtein
+streamlit>=1.18.1
 pandas
-matplotlib
-seaborn
+sacrebleu
 bert-score
