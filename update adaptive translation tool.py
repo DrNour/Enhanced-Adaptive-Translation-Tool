@@ -1,136 +1,161 @@
 import streamlit as st
+import sqlite3
 import time
-import difflib
-from collections import defaultdict
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from nltk.translate.chrf_score import sentence_chrf
-from nltk.translate.meteor_score import meteor_score
-import numpy as np
+from datetime import datetime
 
-# ----------------------------
-# Simple in-memory storage
-# ----------------------------
-EXERCISES = {}        # {exercise_id: {"text": ..., "reference": ..., "assigned": [students]}}
-SUBMISSIONS = defaultdict(list)  # {student: [{"exercise_id": ..., "submission": ..., "metrics": {...}, "time": ..., "keystrokes": ...}]}
+# -----------------------------
+# DB Setup
+# -----------------------------
+def init_db():
+    conn = sqlite3.connect("exercises.db")
+    cur = conn.cursor()
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def calculate_metrics(reference, hypothesis):
-    smoothie = SmoothingFunction().method1
-    ref_tokens = reference.split()
-    hyp_tokens = hypothesis.split()
-    bleu = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smoothie) if hyp_tokens else 0
-    chrf = sentence_chrf([reference], hypothesis) if hypothesis else 0
-    meteor = meteor_score([reference], hypothesis) if hypothesis else 0
-    edit_distance = np.sum([1 for a, b in zip(reference, hypothesis) if a != b]) + abs(len(reference)-len(hypothesis))
-    return {
-        "BLEU": round(bleu, 3),
-        "chrF": round(chrf, 3),
-        "METEOR": round(meteor, 3),
-        "Edit Distance": edit_distance
-    }
+    # Exercises table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS exercises (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        source_text TEXT,
+        ref_translation TEXT
+    )
+    """)
 
-def highlight_diff(reference, student):
-    diff = difflib.ndiff(reference.split(), student.split())
-    ref_out, stud_out = [], []
-    for token in diff:
-        if token.startswith("  "):
-            ref_out.append(token[2:])
-            stud_out.append(token[2:])
-        elif token.startswith("- "):
-            ref_out.append(f"❌{token[2:]}")
-        elif token.startswith("+ "):
-            stud_out.append(f"🆕{token[2:]}")
-    return " ".join(ref_out), " ".join(stud_out)
+    # Submissions table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        exercise_id INTEGER,
+        student_name TEXT,
+        submitted_translation TEXT,
+        time_spent REAL,
+        keystrokes INTEGER,
+        submitted_at TEXT,
+        FOREIGN KEY(exercise_id) REFERENCES exercises(id)
+    )
+    """)
 
-# ----------------------------
+    conn.commit()
+    conn.close()
+
+# -----------------------------
+# DB Functions
+# -----------------------------
+def add_exercise(title, source_text, ref_translation):
+    conn = sqlite3.connect("exercises.db")
+    cur = conn.cursor()
+    cur.execute("INSERT INTO exercises (title, source_text, ref_translation) VALUES (?, ?, ?)",
+                (title, source_text, ref_translation))
+    conn.commit()
+    conn.close()
+
+def get_exercises():
+    conn = sqlite3.connect("exercises.db")
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM exercises")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def add_submission(exercise_id, student_name, submitted_translation, time_spent, keystrokes):
+    conn = sqlite3.connect("exercises.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO submissions (exercise_id, student_name, submitted_translation, time_spent, keystrokes, submitted_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (exercise_id, student_name, submitted_translation, time_spent, keystrokes, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+
+def get_submissions(exercise_id=None):
+    conn = sqlite3.connect("exercises.db")
+    cur = conn.cursor()
+    if exercise_id:
+        cur.execute("SELECT * FROM submissions WHERE exercise_id=?", (exercise_id,))
+    else:
+        cur.execute("SELECT * FROM submissions")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+# -----------------------------
 # Streamlit App
-# ----------------------------
+# -----------------------------
 st.set_page_config(page_title="Adaptive Translation Tool", layout="wide")
-st.title("🌍 Adaptive Translation Tool")
+st.title("🌍 Adaptive Translation Training Tool")
 
-role = st.selectbox("Select your role", ["Instructor", "Student"])
+init_db()
 
-# ----------------------------
-# Instructor Panel
-# ----------------------------
+role = st.sidebar.selectbox("Select Role", ["Instructor", "Student"])
+
+# -----------------------------
+# Instructor View
+# -----------------------------
 if role == "Instructor":
-    st.header("👩‍🏫 Instructor Dashboard")
+    st.header("👨‍🏫 Instructor Dashboard")
 
-    with st.expander("➕ Create Exercise"):
-        ex_id = st.text_input("Exercise ID")
-        ex_text = st.text_area("Source Text")
-        ex_ref = st.text_area("Reference Translation")
-        assign_to = st.text_input("Assign to (comma-separated student names)")
-        if st.button("Save Exercise"):
-            if ex_id and ex_text:
-                EXERCISES[ex_id] = {
-                    "text": ex_text,
-                    "reference": ex_ref,
-                    "assigned": [s.strip() for s in assign_to.split(",")] if assign_to else []
-                }
-                st.success(f"Exercise '{ex_id}' saved & assigned!")
+    st.subheader("Create a New Exercise")
+    with st.form("create_exercise"):
+        title = st.text_input("Exercise Title")
+        source_text = st.text_area("Source Text")
+        ref_translation = st.text_area("Reference Translation")
+        submitted = st.form_submit_button("Add Exercise")
 
-    st.subheader("📊 Leaderboard")
-    scores = []
-    for student, subs in SUBMISSIONS.items():
-        avg_bleu = np.mean([s["metrics"]["BLEU"] for s in subs])
-        scores.append((student, avg_bleu))
-    if scores:
-        for s, b in sorted(scores, key=lambda x: x[1], reverse=True):
-            st.write(f"**{s}** – Avg BLEU: {b:.3f}")
+        if submitted:
+            if title and source_text:
+                add_exercise(title, source_text, ref_translation)
+                st.success("✅ Exercise added successfully!")
+            else:
+                st.error("⚠️ Please provide a title and source text.")
 
-    st.subheader("📂 Student Work")
-    for student, subs in SUBMISSIONS.items():
-        with st.expander(student):
-            for s in subs:
-                st.write(f"**Exercise:** {s['exercise_id']}")
-                st.write(f"**Submission:** {s['submission']}")
-                st.write(f"**Metrics:** {s['metrics']}")
-                st.write(f"**Time Spent:** {s['time']} sec")
-                st.write(f"**Keystrokes:** {s['keystrokes']}")
-                if s['metrics']:
-                    ref, stud = highlight_diff(EXERCISES[s['exercise_id']]["reference"], s['submission'])
-                    st.markdown(f"**Reference:** {ref}")
-                    st.markdown(f"**Student:** {stud}")
-                st.write("---")
+    st.subheader("Available Exercises")
+    exercises = get_exercises()
+    for ex in exercises:
+        st.markdown(f"**{ex[1]}** (ID: {ex[0]})")
+        st.text(f"Source: {ex[2]}")
+        st.text(f"Reference: {ex[3] if ex[3] else '—'}")
 
-# ----------------------------
-# Student Panel
-# ----------------------------
-else:
-    st.header("🧑‍🎓 Student Dashboard")
+    st.subheader("Student Submissions")
+    all_subs = get_submissions()
+    if all_subs:
+        for sub in all_subs:
+            st.markdown(f"📝 Exercise ID: {sub[1]}, Student: {sub[2]}")
+            st.text(f"Translation: {sub[3]}")
+            st.text(f"Time Spent: {sub[4]:.2f} sec, Keystrokes: {sub[5]}")
+            st.caption(f"Submitted at: {sub[6]}")
+            st.markdown("---")
+    else:
+        st.info("No submissions yet.")
+
+# -----------------------------
+# Student View
+# -----------------------------
+if role == "Student":
+    st.header("👩‍🎓 Student Dashboard")
+
     student_name = st.text_input("Enter your name")
-    if student_name:
-        # Assigned exercises
-        assigned = [eid for eid, e in EXERCISES.items() if student_name in e["assigned"]]
-        if assigned:
-            selected = st.selectbox("Choose an exercise", assigned)
-            if selected:
-                exercise = EXERCISES[selected]
-                st.write(f"**Source Text:** {exercise['text']}")
+    exercises = get_exercises()
 
-                # Track editing
-                if f"start_time_{selected}" not in st.session_state:
-                    st.session_state[f"start_time_{selected}"] = time.time()
-                    st.session_state[f"keystrokes_{selected}"] = 0
+    if not exercises:
+        st.warning("⚠️ No exercises available yet. Please wait for the instructor.")
+    else:
+        selected_ex = st.selectbox("Choose an Exercise", exercises, format_func=lambda x: f"{x[1]} (ID {x[0]})")
 
-                submission = st.text_area("Your Translation", key=f"sub_{selected}")
-                st.session_state[f"keystrokes_{selected}"] += len(submission) if submission else 0
+        if selected_ex:
+            st.markdown(f"### Source Text:\n {selected_ex[2]}")
+
+            if student_name:
+                start_time = time.time()
+                keystrokes = st.session_state.get("keystrokes", 0)
+
+                def count_keystrokes():
+                    st.session_state.keystrokes = st.session_state.get("keystrokes", 0) + 1
+
+                student_translation = st.text_area("Your Translation", on_change=count_keystrokes)
 
                 if st.button("Submit Translation"):
                     end_time = time.time()
-                    elapsed = round(end_time - st.session_state[f"start_time_{selected}"], 2)
-                    metrics = calculate_metrics(exercise["reference"], submission) if exercise["reference"] else {}
-                    SUBMISSIONS[student_name].append({
-                        "exercise_id": selected,
-                        "submission": submission,
-                        "metrics": metrics,
-                        "time": elapsed,
-                        "keystrokes": st.session_state[f"keystrokes_{selected}"]
-                    })
-                    st.success("Submission recorded!")
-                    st.write(metrics)
-        else:
-            st.info("No exercises assigned to you yet.")
+                    time_spent = end_time - start_time
+                    add_submission(selected_ex[0], student_name, student_translation, time_spent, keystrokes)
+                    st.success("✅ Translation submitted successfully!")
+            else:
+                st.error("⚠️ Please enter your name first.")
