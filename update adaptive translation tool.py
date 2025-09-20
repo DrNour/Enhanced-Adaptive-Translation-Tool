@@ -1,124 +1,136 @@
 import streamlit as st
-from difflib import SequenceMatcher
-import pandas as pd
 import time
-import os
+import difflib
+from collections import defaultdict
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.chrf_score import sentence_chrf
+from nltk.translate.meteor_score import meteor_score
+import numpy as np
 
-# Optional scoring imports
-try:
-    import sacrebleu
-    SACREBLEU_AVAILABLE = True
-except:
-    SACREBLEU_AVAILABLE = False
+# ----------------------------
+# Simple in-memory storage
+# ----------------------------
+EXERCISES = {}        # {exercise_id: {"text": ..., "reference": ..., "assigned": [students]}}
+SUBMISSIONS = defaultdict(list)  # {student: [{"exercise_id": ..., "submission": ..., "metrics": {...}, "time": ..., "keystrokes": ...}]}
 
-try:
-    from bert_score import score as bert_score
-    BERT_AVAILABLE = True
-except:
-    BERT_AVAILABLE = False
+# ----------------------------
+# Helpers
+# ----------------------------
+def calculate_metrics(reference, hypothesis):
+    smoothie = SmoothingFunction().method1
+    ref_tokens = reference.split()
+    hyp_tokens = hypothesis.split()
+    bleu = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smoothie) if hyp_tokens else 0
+    chrf = sentence_chrf([reference], hypothesis) if hypothesis else 0
+    meteor = meteor_score([reference], hypothesis) if hypothesis else 0
+    edit_distance = np.sum([1 for a, b in zip(reference, hypothesis) if a != b]) + abs(len(reference)-len(hypothesis))
+    return {
+        "BLEU": round(bleu, 3),
+        "chrF": round(chrf, 3),
+        "METEOR": round(meteor, 3),
+        "Edit Distance": edit_distance
+    }
 
-# --- Initialize session state ---
-if "start_time" not in st.session_state:
-    st.session_state.start_time = None
-if "keystrokes" not in st.session_state:
-    st.session_state.keystrokes = []
-if "translations" not in st.session_state:
-    st.session_state.translations = []
+def highlight_diff(reference, student):
+    diff = difflib.ndiff(reference.split(), student.split())
+    ref_out, stud_out = [], []
+    for token in diff:
+        if token.startswith("  "):
+            ref_out.append(token[2:])
+            stud_out.append(token[2:])
+        elif token.startswith("- "):
+            ref_out.append(f"❌{token[2:]}")
+        elif token.startswith("+ "):
+            stud_out.append(f"🆕{token[2:]}")
+    return " ".join(ref_out), " ".join(stud_out)
 
-# --- Role selection ---
-role = st.radio("I am a:", ["Student", "Instructor"])
-name = st.text_input("Enter your name:")
+# ----------------------------
+# Streamlit App
+# ----------------------------
+st.set_page_config(page_title="Adaptive Translation Tool", layout="wide")
+st.title("🌍 Adaptive Translation Tool")
 
-# --- Functions ---
-def record_keystroke():
-    if st.session_state.start_time is None:
-        st.session_state.start_time = time.time()
-    st.session_state.keystrokes.append(time.time())
+role = st.selectbox("Select your role", ["Instructor", "Student"])
 
-def highlight_diff(student, reference):
-    student = str(student) if student else ""
-    reference = str(reference) if reference else ""
-    matcher = SequenceMatcher(None, reference.split(), student.split())
-    highlighted = ""
-    feedback = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        stu_words = " ".join(student.split()[j1:j2])
-        ref_words = " ".join(reference.split()[i1:i2])
-        if tag == "equal":
-            highlighted += f"<span style='color:green'>{stu_words} </span>"
-        elif tag == "replace":
-            highlighted += f"<span style='color:red'>{stu_words} </span>"
-            feedback.append(f"Replace '{stu_words}' with '{ref_words}'")
-        elif tag == "insert":
-            highlighted += f"<span style='color:orange'>{stu_words} </span>"
-            feedback.append(f"Extra words: '{stu_words}'")
-        elif tag == "delete":
-            highlighted += f"<span style='color:blue'>{ref_words} </span>"
-            feedback.append(f"Missing: '{ref_words}'")
-    return highlighted, feedback
+# ----------------------------
+# Instructor Panel
+# ----------------------------
+if role == "Instructor":
+    st.header("👩‍🏫 Instructor Dashboard")
 
-def compute_scores(student, reference):
-    results = {}
-    if reference.strip():
-        if SACREBLEU_AVAILABLE:
-            results["BLEU"] = sacrebleu.corpus_bleu([student], [[reference]]).score
-            results["chrF"] = sacrebleu.corpus_chrf([student], [[reference]]).score
-            results["TER"] = sacrebleu.corpus_ter([student], [[reference]]).score
-        if BERT_AVAILABLE:
-            P, R, F1 = bert_score([student], [reference], lang="en")
-            results["BERT_F1"] = float(F1.mean())
-    return results
+    with st.expander("➕ Create Exercise"):
+        ex_id = st.text_input("Exercise ID")
+        ex_text = st.text_area("Source Text")
+        ex_ref = st.text_area("Reference Translation")
+        assign_to = st.text_input("Assign to (comma-separated student names)")
+        if st.button("Save Exercise"):
+            if ex_id and ex_text:
+                EXERCISES[ex_id] = {
+                    "text": ex_text,
+                    "reference": ex_ref,
+                    "assigned": [s.strip() for s in assign_to.split(",")] if assign_to else []
+                }
+                st.success(f"Exercise '{ex_id}' saved & assigned!")
 
-# --- Student Interface ---
-if role == "Student":
-    st.subheader("Submit your translation")
-    student_translation = st.text_area("Your Translation:", key="student_input", on_change=record_keystroke)
-    reference_translation = ""  # Hide from student
+    st.subheader("📊 Leaderboard")
+    scores = []
+    for student, subs in SUBMISSIONS.items():
+        avg_bleu = np.mean([s["metrics"]["BLEU"] for s in subs])
+        scores.append((student, avg_bleu))
+    if scores:
+        for s, b in sorted(scores, key=lambda x: x[1], reverse=True):
+            st.write(f"**{s}** – Avg BLEU: {b:.3f}")
 
-    submit = st.button("Submit")
-    if submit:
-        time_spent = time.time() - st.session_state.start_time if st.session_state.start_time else 0
-        st.write(f"Time spent: {time_spent:.2f} sec")
-        st.write(f"Keystrokes: {len(st.session_state.keystrokes)}")
+    st.subheader("📂 Student Work")
+    for student, subs in SUBMISSIONS.items():
+        with st.expander(student):
+            for s in subs:
+                st.write(f"**Exercise:** {s['exercise_id']}")
+                st.write(f"**Submission:** {s['submission']}")
+                st.write(f"**Metrics:** {s['metrics']}")
+                st.write(f"**Time Spent:** {s['time']} sec")
+                st.write(f"**Keystrokes:** {s['keystrokes']}")
+                if s['metrics']:
+                    ref, stud = highlight_diff(EXERCISES[s['exercise_id']]["reference"], s['submission'])
+                    st.markdown(f"**Reference:** {ref}")
+                    st.markdown(f"**Student:** {stud}")
+                st.write("---")
 
-        # Highlight edits only if reference exists
-        if reference_translation.strip():
-            highlighted_text, feedback = highlight_diff(student_translation, reference_translation)
-            st.markdown("### Edits Highlighted")
-            st.markdown(highlighted_text, unsafe_allow_html=True)
-            st.write("### Feedback")
-            for f in feedback:
-                st.write(f)
+# ----------------------------
+# Student Panel
+# ----------------------------
+else:
+    st.header("🧑‍🎓 Student Dashboard")
+    student_name = st.text_input("Enter your name")
+    if student_name:
+        # Assigned exercises
+        assigned = [eid for eid, e in EXERCISES.items() if student_name in e["assigned"]]
+        if assigned:
+            selected = st.selectbox("Choose an exercise", assigned)
+            if selected:
+                exercise = EXERCISES[selected]
+                st.write(f"**Source Text:** {exercise['text']}")
 
-        # Optional scoring
-        scores = compute_scores(student_translation, reference_translation)
-        if scores:
-            st.write("### Scores")
-            for k, v in scores.items():
-                st.write(f"{k}: {v}")
+                # Track editing
+                if f"start_time_{selected}" not in st.session_state:
+                    st.session_state[f"start_time_{selected}"] = time.time()
+                    st.session_state[f"keystrokes_{selected}"] = 0
 
-        # Idioms/collocations placeholder
-        st.write("### Idioms/Collocations Suggestions")
-        st.write("Feature coming soon...")
+                submission = st.text_area("Your Translation", key=f"sub_{selected}")
+                st.session_state[f"keystrokes_{selected}"] += len(submission) if submission else 0
 
-        # Save to session / CSV
-        st.session_state.translations.append({
-            "Name": name,
-            "Translation": student_translation,
-            "Time_Spent": time_spent,
-            "Keystrokes": len(st.session_state.keystrokes)
-        })
-        df = pd.DataFrame(st.session_state.translations)
-        df.to_csv("submissions.csv", index=False)
-        st.success("Submission saved!")
-
-# --- Instructor Interface ---
-elif role == "Instructor":
-    st.subheader("Instructor Dashboard")
-    if os.path.exists("submissions.csv"):
-        df = pd.read_csv("submissions.csv")
-        st.dataframe(df)
-    uploaded_file = st.file_uploader("Upload student CSV (optional)")
-    if uploaded_file:
-        df2 = pd.read_csv(uploaded_file)
-        st.dataframe(df2)
+                if st.button("Submit Translation"):
+                    end_time = time.time()
+                    elapsed = round(end_time - st.session_state[f"start_time_{selected}"], 2)
+                    metrics = calculate_metrics(exercise["reference"], submission) if exercise["reference"] else {}
+                    SUBMISSIONS[student_name].append({
+                        "exercise_id": selected,
+                        "submission": submission,
+                        "metrics": metrics,
+                        "time": elapsed,
+                        "keystrokes": st.session_state[f"keystrokes_{selected}"]
+                    })
+                    st.success("Submission recorded!")
+                    st.write(metrics)
+        else:
+            st.info("No exercises assigned to you yet.")
