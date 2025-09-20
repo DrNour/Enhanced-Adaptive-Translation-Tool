@@ -1,174 +1,175 @@
 import streamlit as st
-import pandas as pd
-import nltk
+import sqlite3
 import time
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from nltk.translate.meteor_score import meteor_score
+import difflib
 import sacrebleu
+from bert_score import score as bert_score
+from datetime import datetime
+import nltk
+from nltk.translate.meteor_score import meteor_score
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
-# Download punkt if missing
 nltk.download("punkt", quiet=True)
 
-# Try loading BERTScore safely
-try:
-    from bert_score import score as bert_score
-    BERT_AVAILABLE = True
-except:
-    BERT_AVAILABLE = False
+# ================= DATABASE SETUP =================
+def init_db():
+    conn = sqlite3.connect("translations.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS exercises (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            mt_output TEXT,
+            reference TEXT,
+            created_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exercise_id INTEGER,
+            student_name TEXT,
+            student_edit TEXT,
+            time_spent REAL,
+            keystrokes INTEGER,
+            bleu REAL,
+            meteor REAL,
+            chrf REAL,
+            ter REAL,
+            bert_f1 REAL,
+            submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# --- DATA STRUCTURES ---
-if "exercises" not in st.session_state:
-    st.session_state.exercises = []
+init_db()
 
-if "submissions" not in st.session_state:
-    st.session_state.submissions = []
-
-if "start_time" not in st.session_state:
-    st.session_state.start_time = None
-
-if "keystrokes" not in st.session_state:
-    st.session_state.keystrokes = 0
-
-# --- FUNCTIONS ---
-def evaluate_translation(student_translation, reference_translation):
+# ================= UTILS =================
+def compute_scores(hypothesis, reference):
     results = {}
-
-    # BLEU
     try:
+        # BLEU
         smoothie = SmoothingFunction().method4
-        bleu = sentence_bleu([reference_translation.split()],
-                             student_translation.split(),
-                             smoothing_function=smoothie)
-        results["BLEU"] = round(bleu, 3)
+        results["BLEU"] = round(sentence_bleu([reference.split()], hypothesis.split(), smoothing_function=smoothie), 3)
     except:
         results["BLEU"] = None
-
-    # METEOR
     try:
-        meteor = meteor_score([reference_translation.split()],
-                              student_translation.split())
-        results["METEOR"] = round(meteor, 3)
+        # METEOR
+        results["METEOR"] = round(meteor_score([reference.split()], hypothesis.split()), 3)
     except:
         results["METEOR"] = None
-
-    # chrF & TER
     try:
-        chrf = sacrebleu.corpus_chrf([student_translation],
-                                     [[reference_translation]]).score
-        ter = sacrebleu.corpus_ter([student_translation],
-                                   [[reference_translation]]).score
-        results["chrF"] = round(chrf, 3)
-        results["TER"] = round(ter, 3)
+        # chrF & TER
+        results["chrF"] = round(sacrebleu.corpus_chrf([hypothesis], [[reference]]).score, 3)
+        results["TER"] = round(sacrebleu.corpus_ter([hypothesis], [[reference]]).score, 3)
     except:
-        results["chrF"] = None
-        results["TER"] = None
-
-    # BERTScore if available
-    if BERT_AVAILABLE:
-        try:
-            P, R, F1 = bert_score([student_translation],
-                                  [reference_translation],
-                                  lang="en", verbose=False)
-            results["BERTScore"] = round(F1.mean().item(), 3)
-        except:
-            results["BERTScore"] = None
-    else:
-        results["BERTScore"] = None
-
+        results["chrF"], results["TER"] = None, None
+    try:
+        # BERTScore
+        P, R, F1 = bert_score([hypothesis], [reference], lang="en", rescale_with_baseline=True)
+        results["BERT_F1"] = round(float(F1[0]), 3)
+    except:
+        results["BERT_F1"] = None
     return results
 
-# --- UI ---
-st.sidebar.title("Menu")
-role = st.sidebar.radio("Choose your role:", ["Instructor", "Student"])
+# ================= APP =================
+st.sidebar.title("Navigation")
+role = st.sidebar.selectbox("I am a", ["Student", "Instructor"])
 
 if role == "Instructor":
-    st.title("Instructor Dashboard")
+    st.title("📊 Instructor Dashboard")
+    menu = st.sidebar.radio("Choose Action", ["Create Exercise", "View Submissions"])
 
-    st.subheader("Create a New Exercise")
-    exercise_text = st.text_area("Enter source text:")
-    reference_translation = st.text_area("Enter reference translation:")
-    if st.button("Add Exercise"):
-        if exercise_text and reference_translation:
-            st.session_state.exercises.append({
-                "source": exercise_text,
-                "reference": reference_translation
-            })
-            st.success("Exercise added successfully!")
+    if menu == "Create Exercise":
+        st.subheader("Create a New Exercise")
+        source = st.text_area("Source Text")
+        mt_output = st.text_area("Machine Translation Output")
+        reference = st.text_area("Reference Translation (optional)")
+        instructor = st.text_input("Instructor Name")
 
-    st.subheader("All Exercises")
-    if st.session_state.exercises:
-        for idx, ex in enumerate(st.session_state.exercises, start=1):
-            st.write(f"**Exercise {idx}:** {ex['source']}")
-            st.write(f"Reference: {ex['reference']}")
-    else:
-        st.info("No exercises yet.")
+        if st.button("Save Exercise"):
+            conn = sqlite3.connect("translations.db")
+            c = conn.cursor()
+            c.execute("INSERT INTO exercises (source, mt_output, reference, created_by) VALUES (?, ?, ?, ?)",
+                      (source, mt_output, reference, instructor))
+            conn.commit()
+            conn.close()
+            st.success("✅ Exercise saved!")
 
-    st.subheader("Submissions Summary")
-    if st.session_state.submissions:
-        df = pd.DataFrame(st.session_state.submissions)
-        st.dataframe(df)
-    else:
-        st.info("No student submissions yet.")
+    elif menu == "View Submissions":
+        st.subheader("All Student Submissions")
+        conn = sqlite3.connect("translations.db")
+        c = conn.cursor()
+        c.execute("""
+            SELECT s.id, e.source, e.mt_output, e.reference, s.student_name, s.student_edit,
+                   s.bleu, s.meteor, s.chrf, s.ter, s.bert_f1, s.time_spent, s.keystrokes, s.submitted_at
+            FROM submissions s
+            JOIN exercises e ON s.exercise_id = e.id
+            ORDER BY s.submitted_at DESC
+        """)
+        rows = c.fetchall()
+        conn.close()
+
+        for r in rows:
+            st.markdown(f"""
+**Student:** {r[4]}  
+**Submitted At:** {r[13]}  
+
+**Source:** {r[1]}  
+**MT Output:** {r[2]}  
+**Student Edit:** {r[5]}  
+
+📊 **Scores**  
+- BLEU: {r[6]}  
+- METEOR: {r[7]}  
+- chrF: {r[8]}  
+- TER: {r[9]}  
+- BERT F1: {r[10]}  
+
+⌛ Time Spent: {r[11]} sec  
+⌨️ Keystrokes: {r[12]}  
+""")
+            st.markdown("---")
 
 elif role == "Student":
-    st.title("Student Dashboard")
+    st.title("✍️ Student Editing Exercise")
+    student = st.text_input("Enter Your Name")
+    conn = sqlite3.connect("translations.db")
+    c = conn.cursor()
+    c.execute("SELECT id, source, mt_output, reference FROM exercises ORDER BY created_at DESC")
+    exercises = c.fetchall()
+    conn.close()
 
-    if not st.session_state.exercises:
-        st.warning("No exercises available yet. Please wait for your instructor to add some.")
+    if not exercises:
+        st.warning("⚠️ No exercises available yet.")
     else:
-        exercise_choice = st.selectbox("Choose an exercise:", range(1, len(st.session_state.exercises)+1))
-        chosen_ex = st.session_state.exercises[exercise_choice-1]
+        choice = st.selectbox("Choose an Exercise", [f"Exercise {e[0]}" for e in exercises])
+        selected = exercises[int(choice.split()[1]) - 1]
 
-        st.write("### Source Text")
-        st.info(chosen_ex["source"])
+        st.markdown(f"**Source Text:** {selected[1]}")
+        st.markdown(f"**Machine Translation Output:** {selected[2]}")
+        reference = selected[3]
 
-        # Start timer when entering exercise
-        if st.session_state.start_time is None:
+        # Track keystrokes and time
+        if "start_time" not in st.session_state:
             st.session_state.start_time = time.time()
+        student_edit = st.text_area("Edit the Translation Here ✍️", value=selected[2])
+        keystrokes = len(student_edit)
 
-        # Student translation input
-        student_translation = st.text_area(
-            "Enter your translation here:",
-            on_change=lambda: st.session_state.update({"keystrokes": st.session_state.keystrokes + 1})
-        )
-
-        fluency = st.slider("Rate Fluency (1=Poor, 5=Excellent)", 1, 5, 3)
-        semantic = st.slider("Rate Semantic Accuracy (1=Poor, 5=Excellent)", 1, 5, 3)
-
-        if st.button("Submit Translation"):
-            if student_translation.strip():
-                results = evaluate_translation(student_translation, chosen_ex["reference"])
-
-                # Compute time spent
-                time_spent = round(time.time() - st.session_state.start_time, 2)
-
-                # Save submission
-                st.session_state.submissions.append({
-                    "Exercise": exercise_choice,
-                    "Student Translation": student_translation,
-                    "BLEU": results["BLEU"],
-                    "METEOR": results["METEOR"],
-                    "chrF": results["chrF"],
-                    "TER": results["TER"],
-                    "BERTScore": results["BERTScore"],
-                    "Keystrokes": st.session_state.keystrokes,
-                    "Time Spent (s)": time_spent,
-                    "Fluency (Self)": fluency,
-                    "Semantic Accuracy (Self)": semantic
-                })
-
-                st.success("Translation submitted and evaluated!")
-
-                st.write("### Your Scores")
-                st.json(results)
-
-                st.write(f"**Keystrokes:** {st.session_state.keystrokes}")
-                st.write(f"**Time Spent:** {time_spent} seconds")
-                st.write(f"**Fluency (self):** {fluency}")
-                st.write(f"**Semantic Accuracy (self):** {semantic}")
-
-                # Reset for next attempt
-                st.session_state.start_time = None
-                st.session_state.keystrokes = 0
-            else:
-                st.error("Please enter your translation before submitting.")
+        if st.button("Submit"):
+            time_spent = round(time.time() - st.session_state.start_time, 2)
+            scores = compute_scores(student_edit, reference or "")
+            conn = sqlite3.connect("translations.db")
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO submissions (exercise_id, student_name, student_edit,
+                                         time_spent, keystrokes, bleu, meteor, chrf, ter, bert_f1)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (selected[0], student, student_edit, time_spent, keystrokes,
+                  scores.get("BLEU"), scores.get("METEOR"), scores.get("chrF"), scores.get("TER"), scores.get("BERT_F1")))
+            conn.commit()
+            conn.close()
+            st.success("✅ Submission saved!")
+            st.json(scores)
