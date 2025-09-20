@@ -1,8 +1,5 @@
-streamlit==1.49.1
+streamlit>=1.14
 sacrebleu
 python-Levenshtein
-pandas
-matplotlib
-seaborn
 bert-score
-comet-ml
+sqlite3
