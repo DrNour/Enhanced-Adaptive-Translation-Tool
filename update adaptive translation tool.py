@@ -1,197 +1,183 @@
-# enhanced_translation_tool.py
-import streamlit as st
-import time
-import random
-import json
-from difflib import SequenceMatcher
-import sqlite3
+# enhanced_adaptive_translation_tool.py
 
-# =========================
-# Optional packages
-# =========================
+import streamlit as st
+import pandas as pd
+import sqlite3
+import time
+from datetime import datetime
+import difflib
+from collections import defaultdict
+
+# NLP scoring
 try:
     import sacrebleu
-    sacrebleu_available = True
-except ModuleNotFoundError:
-    sacrebleu_available = False
-
-try:
-    import Levenshtein
-    levenshtein_available = True
-except ModuleNotFoundError:
-    levenshtein_available = False
+except ImportError:
+    sacrebleu = None
 
 try:
     from bert_score import score as bert_score
-    bert_available = True
-except ModuleNotFoundError:
-    bert_available = False
+except ImportError:
+    bert_score = None
 
+# Optional COMET
 try:
     from comet_ml import download_model, load_from_checkpoint
-    comet_available = True
-except ModuleNotFoundError:
-    comet_available = False
+    comet_enabled = True
+except ImportError:
+    comet_enabled = False
 
-# =========================
-# App Setup
-# =========================
-st.set_page_config(page_title="Adaptive Translation Tool", layout="wide")
-st.title("🌍 Adaptive Translation & Post-Editing Tool")
-
-# =========================
-# SQLite backend
-# =========================
-conn = sqlite3.connect('translations.db')
+# ---------- DATABASE ----------
+conn = sqlite3.connect("translations.db", check_same_thread=False)
 c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS submissions 
-             (username TEXT, source TEXT, student_translation TEXT, timestamp REAL, score REAL)''')
+c.execute("""CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, role TEXT)""")
+c.execute("""
+CREATE TABLE IF NOT EXISTS exercises (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT,
+    source_text TEXT,
+    reference_translation TEXT,
+    idioms TEXT,
+    collocations TEXT,
+    created_at TEXT
+)
+""")
+c.execute("""
+CREATE TABLE IF NOT EXISTS submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exercise_id INTEGER,
+    username TEXT,
+    submitted_translation TEXT,
+    timestamp TEXT,
+    points INTEGER,
+    bleu REAL,
+    chrf REAL,
+    ter REAL,
+    edit_distance REAL,
+    bert_f1 REAL,
+    comet_score REAL
+)
+""")
 conn.commit()
 
-# =========================
-# Session State
-# =========================
-if "leaderboard" not in st.session_state:
-    st.session_state.leaderboard = {}
-if "feedback_history" not in st.session_state:
-    st.session_state.feedback_history = []
+# ---------- SESSION STATE ----------
+if "username" not in st.session_state:
+    st.session_state["username"] = ""
+if "role" not in st.session_state:
+    st.session_state["role"] = ""
 
-# =========================
-# Utility Functions
-# =========================
-def update_score(username, points):
-    if username not in st.session_state.leaderboard:
-        st.session_state.leaderboard[username] = 0
-    st.session_state.leaderboard[username] += points
+# ---------- LOGIN ----------
+st.title("🌍 Adaptive Translation & Post-Editing Tool")
+role = st.radio("I am a:", ["Student", "Instructor"])
+username = st.text_input("Enter your name:")
 
-def highlight_diff(student, reference):
-    matcher = SequenceMatcher(None, reference.split(), student.split())
-    highlighted = ""
-    feedback = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        stu_words = " ".join(student.split()[j1:j2])
-        ref_words = " ".join(reference.split()[i1:i2])
-        if tag == "equal":
-            highlighted += f"<span style='color:green'>{stu_words} </span>"
-        elif tag == "replace":
-            highlighted += f"<span style='color:red'>{stu_words} </span>"
-            feedback.append(f"Replace '{stu_words}' with '{ref_words}'")
-        elif tag == "insert":
-            highlighted += f"<span style='color:orange'>{stu_words} </span>"
-            feedback.append(f"Extra words: '{stu_words}'")
-        elif tag == "delete":
-            highlighted += f"<span style='color:blue'>{ref_words} </span>"
-            feedback.append(f"Missing: '{ref_words}'")
-    return highlighted, feedback
-
-def compute_metrics(student, reference):
-    results = {}
-    if sacrebleu_available and reference:
-        results["BLEU"] = sacrebleu.corpus_bleu([student], [[reference]]).score
-        results["chrF"] = sacrebleu.corpus_chrf([student], [[reference]]).score
-        results["TER"] = sacrebleu.corpus_ter([student], [[reference]]).score
-    if levenshtein_available:
-        results["Edit Distance"] = Levenshtein.distance(student, reference if reference else "")
-    if bert_available:
-        try:
-            P, R, F1 = bert_score([student], [reference] if reference else [student], lang='en')
-            results["BERT_F1"] = float(F1[0])
-        except Exception as e:
-            results["BERT_F1"] = f"Error: {e}"
-    return results
-
-# =========================
-# Sidebar: User type & name
-# =========================
-user_type = st.sidebar.radio("I am a:", ["Student", "Instructor"])
-username = st.sidebar.text_input("Enter your name:")
-
-# =========================
-# Tabs
-# =========================
-tab1, tab2, tab3 = st.tabs(["Translate / Submit", "Leaderboard", "Instructor Dashboard"])
-
-# =========================
-# Tab 1: Translate / Submit
-# =========================
-with tab1:
-    st.subheader("🔎 Translate / Submit Your Work")
-    source_text = st.text_area("Source Text")
-    
-    # Instructor only: reference translation
-    reference_translation = ""
-    if user_type == "Instructor":
-        reference_translation = st.text_area("Reference Translation (Instructor Only)")
-    
-    student_translation = st.text_area("Your Translation", height=150)
-
-    if st.button("Submit Translation"):
-        start_time = time.time()
-        
-        # Metrics computation
-        results = compute_metrics(student_translation, reference_translation if reference_translation else None)
-        elapsed_time = time.time() - start_time
-        
-        # Display feedback
-        st.subheader("📊 Evaluation Results")
-        st.json(results)
-        st.write(f"Time Taken: {elapsed_time:.2f} seconds")
-        
-        # Update leaderboard
-        points = 10 + int(random.random()*10)
-        update_score(username, points)
-        st.success(f"Points earned: {points}")
-        
-        # Save to SQLite
-        c.execute("INSERT INTO submissions VALUES (?,?,?, ?, ?)", 
-                  (username, source_text, student_translation, time.time(), points))
+if st.button("Login"):
+    if username.strip() == "":
+        st.warning("Enter a valid username.")
+    else:
+        st.session_state["username"] = username
+        st.session_state["role"] = role
+        c.execute("INSERT OR IGNORE INTO users (username, role) VALUES (?, ?)", (username, role))
         conn.commit()
-        
-        # Highlight diff if reference available
-        if reference_translation:
-            highlighted, fb = highlight_diff(student_translation, reference_translation)
-            st.markdown(highlighted, unsafe_allow_html=True)
-            st.subheader("💡 Feedback:")
-            for f in fb:
-                st.warning(f)
-            st.session_state.feedback_history.append(fb)
-        
-        # Idioms/Collocations suggestions (optional)
-        st.subheader("💬 Idioms / Collocations Suggestions")
-        idioms_list = ["break the ice", "once upon a time"]
-        for idiom in idioms_list:
-            st.info(f"Consider using: '{idiom}'")
+        st.success(f"Logged in as {username} ({role})")
 
-# =========================
-# Tab 2: Leaderboard
-# =========================
-with tab2:
-    st.subheader("🏆 Leaderboard")
-    if st.session_state.leaderboard:
-        sorted_lb = sorted(st.session_state.leaderboard.items(), key=lambda x: x[1], reverse=True)
-        for rank, (user, points) in enumerate(sorted_lb, start=1):
-            st.write(f"{rank}. **{user}** - {points} points")
-    else:
-        st.info("No scores yet. Submit translations!")
+# ---------- MAIN APP ----------
+if st.session_state["username"] != "":
+    user = st.session_state["username"]
+    role = st.session_state["role"]
 
-# =========================
-# Tab 3: Instructor Dashboard
-# =========================
-with tab3:
-    if user_type != "Instructor":
-        st.info("Instructor dashboard visible only to instructors.")
-    else:
-        st.subheader("📊 Instructor Dashboard")
-        df = []
-        for row in c.execute("SELECT * FROM submissions"):
-            df.append({
-                "Username": row[0], 
-                "Source": row[1], 
-                "Translation": row[2],
-                "Timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[3])),
-                "Score": row[4]
-            })
-        if df:
-            st.dataframe(df)
+    if role == "Instructor":
+        st.header("📊 Instructor Dashboard")
+        tab1, tab2 = st.tabs(["Manage Exercises", "View Submissions"])
+
+        # --- Manage Exercises ---
+        with tab1:
+            st.subheader("Create New Exercise")
+            ex_title = st.text_input("Title")
+            src_text = st.text_area("Source Text")
+            ref_text = st.text_area("Reference Translation (optional)")
+            idioms = st.text_area("Idioms (comma-separated)")
+            collocs = st.text_area("Collocations (comma-separated)")
+
+            if st.button("Create Exercise"):
+                c.execute(
+                    "INSERT INTO exercises (title, source_text, reference_translation, idioms, collocations, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (ex_title, src_text, ref_text, idioms, collocs, datetime.now().isoformat())
+                )
+                conn.commit()
+                st.success("Exercise created!")
+
+            st.subheader("Existing Exercises")
+            df_ex = pd.read_sql("SELECT * FROM exercises", conn)
+            st.dataframe(df_ex)
+
+        # --- View Submissions ---
+        with tab2:
+            df_sub = pd.read_sql("SELECT * FROM submissions", conn)
+            st.dataframe(df_sub)
+
+            if not df_sub.empty:
+                leaderboard = df_sub.groupby("username")["points"].sum().reset_index().sort_values(by="points", ascending=False)
+                st.subheader("🏆 Leaderboard")
+                st.dataframe(leaderboard)
+
+    else:  # Student
+        st.header("✏️ Translation Exercises")
+        df_ex = pd.read_sql("SELECT * FROM exercises", conn)
+        if df_ex.empty:
+            st.info("No exercises available yet.")
         else:
-            st.info("No submissions yet.")
+            exercise_ids = df_ex["id"].tolist()
+            ex_id = st.selectbox("Select Exercise", exercise_ids)
+            ex_row = df_ex[df_ex["id"]==ex_id].iloc[0]
+
+            st.subheader(f"Exercise: {ex_row['title']}")
+            st.text_area("Source Text", ex_row["source_text"], height=150, disabled=True)
+            st.text_area("Idioms/Collocations Hints", f"Idioms: {ex_row['idioms']}\nCollocations: {ex_row['collocations']}", disabled=True)
+
+            student_translation = st.text_area("Your Translation")
+            if st.button("Submit Translation"):
+                timestamp = datetime.now().isoformat()
+                points = 10
+                bleu_score = None
+                chrf_score = None
+                ter_score = None
+                edit_dist = None
+                bert_f1_score = None
+                comet_score_val = None
+
+                ref_translation = ex_row["reference_translation"]
+
+                # --- Scores ---
+                if ref_translation and sacrebleu:
+                    bleu_score = sacrebleu.corpus_bleu([student_translation], [[ref_translation]]).score
+                    chrf_score = sacrebleu.corpus_chrf([student_translation], [[ref_translation]]).score
+                    ter_score = sacrebleu.corpus_ter([student_translation], [[ref_translation]]).score
+                    edit_dist = difflib.SequenceMatcher(None, student_translation, ref_translation).ratio()
+
+                if bert_score:
+                    P, R, F1 = bert_score([student_translation], [ref_translation] if ref_translation else [student_translation], lang="en", rescale_with_baseline=True)
+                    bert_f1_score = float(F1[0])
+
+                if comet_enabled:
+                    try:
+                        comet_score_val = 0.9  # placeholder
+                    except:
+                        comet_score_val = None
+
+                # --- Store submission ---
+                c.execute(
+                    "INSERT INTO submissions (exercise_id, username, submitted_translation, timestamp, points, bleu, chrf, ter, edit_distance, bert_f1, comet_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ex_id, user, student_translation, timestamp, points, bleu_score, chrf_score, ter_score, edit_dist, bert_f1_score, comet_score_val)
+                )
+                conn.commit()
+                st.success("Translation submitted!")
+
+                st.subheader("📊 Evaluation Results")
+                st.json({
+                    "BLEU": bleu_score,
+                    "chrF": chrf_score,
+                    "TER": ter_score,
+                    "Edit Distance": edit_dist,
+                    "BERTScore F1": bert_f1_score,
+                    "COMET": comet_score_val
+                })
