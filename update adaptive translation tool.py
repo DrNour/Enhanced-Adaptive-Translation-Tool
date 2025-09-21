@@ -1,10 +1,15 @@
 import streamlit as st
 import sqlite3
 import time
-import difflib
 import sacrebleu
-from bert_score import score as bert_score
 from datetime import datetime
+
+# Optional BERTScore import
+try:
+    from bert_score import score as bert_score
+    BERT_AVAILABLE = True
+except ImportError:
+    BERT_AVAILABLE = False
 
 # ============ DATABASE SETUP ============
 def init_db():
@@ -42,20 +47,22 @@ init_db()
 
 # ============ UTILS ============
 def compute_scores(hypothesis, reference):
-    """Compute BLEU, chrF, TER, and BERTScore."""
+    """Compute BLEU, chrF, TER, and optionally BERTScore."""
     results = {}
     if reference.strip():
-        bleu = sacrebleu.corpus_bleu([hypothesis], [[reference]]).score
-        chrf = sacrebleu.corpus_chrf([hypothesis], [[reference]]).score
-        ter = sacrebleu.corpus_ter([hypothesis], [[reference]]).score
-        results.update({"BLEU": bleu, "chrF": chrf, "TER": ter})
+        results["BLEU"] = sacrebleu.corpus_bleu([hypothesis], [[reference]]).score
+        results["chrF"] = sacrebleu.corpus_chrf([hypothesis], [[reference]]).score
+        results["TER"] = sacrebleu.corpus_ter([hypothesis], [[reference]]).score
     else:
         results.update({"BLEU": None, "chrF": None, "TER": None})
 
-    try:
-        P, R, F1 = bert_score([hypothesis], [reference], lang="en", rescale_with_baseline=True)
-        results["BERT_F1"] = float(F1[0])
-    except Exception as e:
+    if BERT_AVAILABLE and reference.strip():
+        try:
+            P, R, F1 = bert_score([hypothesis], [reference], lang="en", rescale_with_baseline=True)
+            results["BERT_F1"] = float(F1[0])
+        except:
+            results["BERT_F1"] = None
+    else:
         results["BERT_F1"] = None
 
     return results
@@ -66,7 +73,6 @@ role = st.sidebar.selectbox("I am a", ["Student", "Instructor"])
 
 if role == "Instructor":
     st.title("📚 Instructor Dashboard")
-
     menu = st.sidebar.radio("Choose Action", ["Create Editing Exercise", "View Submissions"])
 
     if menu == "Create Editing Exercise":
@@ -75,7 +81,6 @@ if role == "Instructor":
         mt_output = st.text_area("Machine Translation Output")
         reference = st.text_area("Reference Translation (optional)")
         instructor = st.text_input("Instructor Name")
-
         if st.button("Save Exercise"):
             conn = sqlite3.connect("translations.db")
             c = conn.cursor()
@@ -91,7 +96,8 @@ if role == "Instructor":
         c = conn.cursor()
         c.execute("""
             SELECT es.id, e.source, e.mt_output, e.reference, es.student_name,
-                   es.student_edit, es.bleu, es.chrf, es.ter, es.bert_f1, es.time_spent, es.keystrokes, es.submitted_at
+                   es.student_edit, es.bleu, es.chrf, es.ter, es.bert_f1,
+                   es.time_spent, es.keystrokes, es.submitted_at
             FROM editing_submissions es
             JOIN editing_exercises e ON es.exercise_id = e.id
             ORDER BY es.submitted_at DESC
@@ -101,27 +107,26 @@ if role == "Instructor":
 
         for r in rows:
             st.markdown(f"""
-            **Student:** {r[4]}  
-            **Submitted At:** {r[12]}  
-            **Source:** {r[1]}  
-            **MT Output:** {r[2]}  
-            **Student Edit:** {r[5]}  
-            **Reference:** {r[3]}  
+**Student:** {r[4]}  
+**Submitted At:** {r[12]}  
+**Source:** {r[1]}  
+**MT Output:** {r[2]}  
+**Student Edit:** {r[5]}  
+**Reference:** {r[3]}  
 
-            📊 **Scores**  
-            - BLEU: {r[6]}  
-            - chrF: {r[7]}  
-            - TER: {r[8]}  
-            - BERT F1: {r[9]}  
+📊 **Scores**  
+- BLEU: {r[6]}  
+- chrF: {r[7]}  
+- TER: {r[8]}  
+- BERT F1: {r[9]}  
 
-            ⌛ **Time Spent:** {r[10]} sec  
-            ⌨️ **Keystrokes:** {r[11]}  
-            """)
+⌛ **Time Spent:** {r[10]} sec  
+⌨️ **Keystrokes:** {r[11]}  
+""")
             st.markdown("---")
 
 elif role == "Student":
     st.title("✍️ Student Editing Exercise")
-
     student = st.text_input("Enter your name")
     conn = sqlite3.connect("translations.db")
     c = conn.cursor()
@@ -134,12 +139,10 @@ elif role == "Student":
     else:
         choice = st.selectbox("Choose an Exercise", [f"Exercise {e[0]}" for e in exercises])
         selected = exercises[int(choice.split()[1]) - 1]
-
         st.markdown(f"**Source Text:** {selected[1]}")
         st.markdown(f"**Machine Translation Output:** {selected[2]}")
         reference = selected[3]
 
-        # Start tracking edits
         start_time = time.time()
         student_edit = st.text_area("Edit the Translation Here ✍️", value=selected[2])
         keystrokes = len(student_edit)
@@ -147,7 +150,6 @@ elif role == "Student":
         if st.button("Submit"):
             end_time = time.time()
             time_spent = round(end_time - start_time, 2)
-
             scores = compute_scores(student_edit, reference or "")
 
             conn = sqlite3.connect("translations.db")
