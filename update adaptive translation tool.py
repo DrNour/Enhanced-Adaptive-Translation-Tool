@@ -1,17 +1,18 @@
 import streamlit as st
 import sqlite3
 import time
-import difflib
 import sacrebleu
-from bert_score import score as bert_score
 from datetime import datetime
-import nltk
-from nltk.translate.meteor_score import meteor_score
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import difflib
 
-nltk.download("punkt", quiet=True)
+# Optional heavy import (wrapped in try/except so app won't crash)
+try:
+    from bert_score import score as bert_score
+    BERT_AVAILABLE = True
+except ImportError:
+    BERT_AVAILABLE = False
 
-# ================= DATABASE SETUP =================
+# ============ DATABASE ============
 def init_db():
     conn = sqlite3.connect("translations.db")
     c = conn.cursor()
@@ -34,10 +35,10 @@ def init_db():
             time_spent REAL,
             keystrokes INTEGER,
             bleu REAL,
-            meteor REAL,
             chrf REAL,
             ter REAL,
             bert_f1 REAL,
+            similarity REAL,
             submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -46,40 +47,51 @@ def init_db():
 
 init_db()
 
-# ================= UTILS =================
-def compute_scores(hypothesis, reference):
+# ============ SCORING ============
+def compute_scores(hypothesis, reference, use_bert=True):
     results = {}
+    if not reference.strip():
+        return {"BLEU": None, "chrF": None, "TER": None, "BERT_F1": None, "similarity": None}
+
     try:
-        # BLEU
-        smoothie = SmoothingFunction().method4
-        results["BLEU"] = round(sentence_bleu([reference.split()], hypothesis.split(), smoothing_function=smoothie), 3)
+        results["BLEU"] = round(sacrebleu.corpus_bleu([hypothesis], [[reference]]).score, 3)
     except:
         results["BLEU"] = None
+
     try:
-        # METEOR
-        results["METEOR"] = round(meteor_score([reference.split()], hypothesis.split()), 3)
-    except:
-        results["METEOR"] = None
-    try:
-        # chrF & TER
         results["chrF"] = round(sacrebleu.corpus_chrf([hypothesis], [[reference]]).score, 3)
+    except:
+        results["chrF"] = None
+
+    try:
         results["TER"] = round(sacrebleu.corpus_ter([hypothesis], [[reference]]).score, 3)
     except:
-        results["chrF"], results["TER"] = None, None
+        results["TER"] = None
+
+    # Fallback: difflib similarity
     try:
-        # BERTScore
-        P, R, F1 = bert_score([hypothesis], [reference], lang="en", rescale_with_baseline=True)
-        results["BERT_F1"] = round(float(F1[0]), 3)
+        results["similarity"] = round(difflib.SequenceMatcher(None, hypothesis, reference).ratio(), 3)
     except:
+        results["similarity"] = None
+
+    # BERTScore (optional)
+    if use_bert and BERT_AVAILABLE:
+        try:
+            _, _, F1 = bert_score([hypothesis], [reference], lang="en", rescale_with_baseline=True)
+            results["BERT_F1"] = float(round(F1[0].item(), 3))
+        except:
+            results["BERT_F1"] = None
+    else:
         results["BERT_F1"] = None
+
     return results
 
-# ================= APP =================
+# ============ APP ============
 st.sidebar.title("Navigation")
 role = st.sidebar.selectbox("I am a", ["Student", "Instructor"])
 
 if role == "Instructor":
-    st.title("📊 Instructor Dashboard")
+    st.title("📚 Instructor Dashboard")
     menu = st.sidebar.radio("Choose Action", ["Create Exercise", "View Submissions"])
 
     if menu == "Create Exercise":
@@ -96,15 +108,16 @@ if role == "Instructor":
                       (source, mt_output, reference, instructor))
             conn.commit()
             conn.close()
-            st.success("✅ Exercise saved!")
+            st.success("✅ Exercise created successfully!")
 
     elif menu == "View Submissions":
-        st.subheader("All Student Submissions")
+        st.subheader("Student Submissions")
         conn = sqlite3.connect("translations.db")
         c = conn.cursor()
         c.execute("""
-            SELECT s.id, e.source, e.mt_output, e.reference, s.student_name, s.student_edit,
-                   s.bleu, s.meteor, s.chrf, s.ter, s.bert_f1, s.time_spent, s.keystrokes, s.submitted_at
+            SELECT s.id, e.source, e.mt_output, e.reference, s.student_name,
+                   s.student_edit, s.bleu, s.chrf, s.ter, s.bert_f1, s.similarity,
+                   s.time_spent, s.keystrokes, s.submitted_at
             FROM submissions s
             JOIN exercises e ON s.exercise_id = e.id
             ORDER BY s.submitted_at DESC
@@ -114,28 +127,29 @@ if role == "Instructor":
 
         for r in rows:
             st.markdown(f"""
-**Student:** {r[4]}  
-**Submitted At:** {r[13]}  
+            **Student:** {r[4]}  
+            **Submitted At:** {r[13]}  
+            **Source:** {r[1]}  
+            **MT Output:** {r[2]}  
+            **Student Edit:** {r[5]}  
+            **Reference:** {r[3]}  
 
-**Source:** {r[1]}  
-**MT Output:** {r[2]}  
-**Student Edit:** {r[5]}  
+            📊 **Scores**  
+            - BLEU: {r[6]}  
+            - chrF: {r[7]}  
+            - TER: {r[8]}  
+            - BERT F1: {r[9]}  
+            - Similarity: {r[10]}  
 
-📊 **Scores**  
-- BLEU: {r[6]}  
-- METEOR: {r[7]}  
-- chrF: {r[8]}  
-- TER: {r[9]}  
-- BERT F1: {r[10]}  
-
-⌛ Time Spent: {r[11]} sec  
-⌨️ Keystrokes: {r[12]}  
-""")
+            ⌛ **Time Spent:** {r[11]} sec  
+            ⌨️ **Keystrokes:** {r[12]}  
+            """)
             st.markdown("---")
 
 elif role == "Student":
-    st.title("✍️ Student Editing Exercise")
-    student = st.text_input("Enter Your Name")
+    st.title("✍️ Student Exercise")
+    student = st.text_input("Enter your name")
+
     conn = sqlite3.connect("translations.db")
     c = conn.cursor()
     c.execute("SELECT id, source, mt_output, reference FROM exercises ORDER BY created_at DESC")
@@ -143,7 +157,7 @@ elif role == "Student":
     conn.close()
 
     if not exercises:
-        st.warning("⚠️ No exercises available yet.")
+        st.warning("⚠️ No exercises available yet. Please wait for your instructor.")
     else:
         choice = st.selectbox("Choose an Exercise", [f"Exercise {e[0]}" for e in exercises])
         selected = exercises[int(choice.split()[1]) - 1]
@@ -152,24 +166,28 @@ elif role == "Student":
         st.markdown(f"**Machine Translation Output:** {selected[2]}")
         reference = selected[3]
 
-        # Track keystrokes and time
-        if "start_time" not in st.session_state:
-            st.session_state.start_time = time.time()
+        start_time = time.time()
         student_edit = st.text_area("Edit the Translation Here ✍️", value=selected[2])
         keystrokes = len(student_edit)
 
+        use_bert = st.checkbox("Enable BERTScore (slower, optional)", value=False)
+
         if st.button("Submit"):
-            time_spent = round(time.time() - st.session_state.start_time, 2)
-            scores = compute_scores(student_edit, reference or "")
+            end_time = time.time()
+            time_spent = round(end_time - start_time, 2)
+            scores = compute_scores(student_edit, reference or "", use_bert=use_bert)
+
             conn = sqlite3.connect("translations.db")
             c = conn.cursor()
             c.execute("""
                 INSERT INTO submissions (exercise_id, student_name, student_edit,
-                                         time_spent, keystrokes, bleu, meteor, chrf, ter, bert_f1)
+                                         time_spent, keystrokes, bleu, chrf, ter, bert_f1, similarity)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (selected[0], student, student_edit, time_spent, keystrokes,
-                  scores.get("BLEU"), scores.get("METEOR"), scores.get("chrF"), scores.get("TER"), scores.get("BERT_F1")))
+                  scores.get("BLEU"), scores.get("chrF"), scores.get("TER"),
+                  scores.get("BERT_F1"), scores.get("similarity")))
             conn.commit()
             conn.close()
-            st.success("✅ Submission saved!")
+
+            st.success("✅ Submission saved and evaluated!")
             st.json(scores)
